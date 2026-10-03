@@ -8,7 +8,7 @@ import ScreenCaptureKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-private enum Speaker: String, CaseIterable {
+enum Speaker: String, CaseIterable {
     case selfUser = "自分"
     case others = "相手"
 }
@@ -16,6 +16,7 @@ private enum Speaker: String, CaseIterable {
 private struct TranscriptLine: Identifiable {
     let id = UUID()
     let offset: TimeInterval
+    let endOffset: TimeInterval?
     let speaker: Speaker
     let text: String
 
@@ -50,18 +51,38 @@ private final class AppModel: ObservableObject {
     @Published var isProcessing = false
     @Published var isStarting = false
     @Published var isStopping = false
+    @Published var isAwaitingBatchChoice = false
+    @Published var isBatchTranscribing = false
+    @Published var batchProgress = 0.0
+    @Published var batchProgressDetail = ""
+    @Published var estimatedBatchCompletion: Date?
+    @Published var lastBatchProgressAt: Date?
     @Published var status = "モデルと whisper-cli を準備してください"
     @Published var lines: [TranscriptLine] = []
     @Published var modelPath: URL? = AppModel.defaultModelURL
+    @Published var batchModelPath: URL? = AppModel.defaultBatchModelURL
     @Published var whisperPath: URL? = AppModel.findWhisperCLI()
     @Published var downloadProgress: Double?
+    @Published var batchDownloadProgress: Double?
     @Published var meetingPrompt: String?
     @Published var autoDetect = true
     @Published var audioDiagnosticSummary = ""
 
     private var capture: MeetingAudioCapture?
+    private var audioArchive: SessionAudioArchive?
+    private var archiveFailureMessage: String?
+    private var batchFailureMessage: String?
+    private var batchStarted = false
+    private var batchDecisionMade = false
+    private var batchRunID = UUID()
+    private var batchFallbackSpeakers = Set<Speaker>()
+    private var batchProgressStartedAt: Date?
+    private var lastObservedBatchFraction = 0.0
+    private var lastObservedBatchProgressAt: Date?
+    private var smoothedBatchSecondsPerFraction: TimeInterval?
     private let inferenceQueue = OperationQueue()
     private var sessionStartedAt = Date()
+    private var sessionStartedUptime: TimeInterval?
     private var detectorTask: Task<Void, Never>?
     private var pendingSegments = 0
     private var failedSegments = 0
@@ -70,6 +91,7 @@ private final class AppModel: ObservableObject {
     private var queuedAudioSeconds: TimeInterval = 0
     private let maximumQueuedAudioSeconds: TimeInterval = 180
     private var downloadProgressObservation: NSKeyValueObservation?
+    private var batchDownloadProgressObservation: NSKeyValueObservation?
     private var backendValidated = false
     private var captureStartFailureMessage: String?
     private var meetingWasVisible = false
@@ -78,25 +100,49 @@ private final class AppModel: ObservableObject {
     private var sttMetrics: [Speaker: STTMetrics] = [.selfUser: STTMetrics(), .others: STTMetrics()]
 
     init() {
+        Task.detached(priority: .utility) { SessionAudioArchive.removeAbandonedArchives() }
         inferenceQueue.maxConcurrentOperationCount = 1
         inferenceQueue.qualityOfService = .userInitiated
-        if ready { status = "準備完了です。開始を押してください。" }
+        if ready {
+            status = batchModelPath == nil
+                ? "リアルタイム認識は準備済みです。録音後用のWhisper large-v3を取得してください。"
+                : "準備完了です。開始を押してください。"
+        }
         startMeetingMonitor()
     }
 
     static let modelFile = "ggml-kotoba-whisper-v2.0-q5_0.bin"
     nonisolated static let modelSizeBytes: Int64 = 537_819_875
     static let modelURL = URL(string: "https://huggingface.co/kotoba-tech/kotoba-whisper-v2.0-ggml/resolve/a10e12364e78988c774a6a60a83a6f65ffd60c01/ggml-kotoba-whisper-v2.0-q5_0.bin")!
+    static let batchModelFile = "ggml-large-v3.bin"
+    static let batchModelURL = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/c521a4b02f422512d734391fdf08bb08c0862f68/ggml-large-v3.bin")!
     static var defaultModelURL: URL? {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MeetingScribe/Models/\(modelFile)")
         return isValidModel(url) ? url : nil
     }
 
+    static var defaultBatchModelURL: URL? {
+        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MeetingScribe/Models/\(batchModelFile)")
+        return isValidBatchModel(url) ? url : nil
+    }
+
     static func isValidModel(_ url: URL) -> Bool {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? NSNumber else { return false }
         return size.int64Value == modelSizeBytes
+    }
+
+    nonisolated static func isValidBatchModel(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              (3_000_000_000...3_400_000_000).contains(size.int64Value),
+              let handle = try? FileHandle(forReadingFrom: url),
+              let magic = try? handle.read(upToCount: 4),
+              magic == Data([0x6c, 0x6d, 0x67, 0x67]) else { return false }
+        try? handle.close()
+        return true
     }
 
     static func findWhisperCLI() -> URL? {
@@ -108,7 +154,7 @@ private final class AppModel: ObservableObject {
     var ready: Bool { modelPath.map(Self.isValidModel) == true && whisperPath.map { FileManager.default.isExecutableFile(atPath: $0.path) && $0.lastPathComponent == "whisper-cli" } == true }
 
     func downloadModel() {
-        guard downloadProgress == nil else { return }
+        guard downloadProgress == nil, batchDownloadProgress == nil else { return }
         let destination = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("MeetingScribe/Models/\(Self.modelFile)")
         do { try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true) }
@@ -149,6 +195,46 @@ private final class AppModel: ObservableObject {
         task.resume()
     }
 
+    func downloadBatchModel() {
+        guard batchDownloadProgress == nil, downloadProgress == nil, !isRecording, !isProcessing, !isStarting, !isStopping else { return }
+        let destination = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MeetingScribe/Models/\(Self.batchModelFile)")
+        do { try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true) }
+        catch { status = "モデル保存先を作成できません: \(error.localizedDescription)"; return }
+        batchDownloadProgress = 0
+        status = "Whisper large-v3 をダウンロード中（約3.1 GB）"
+        let task = URLSession.shared.downloadTask(with: Self.batchModelURL) { [weak self] temporaryURL, response, error in
+            let result: Result<Void, Error>
+            if let error { result = .failure(error) }
+            else if let temporaryURL, let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) {
+                do {
+                    guard Self.isValidBatchModel(temporaryURL) else { throw CaptureError.download }
+                    if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
+                    try FileManager.default.moveItem(at: temporaryURL, to: destination)
+                    result = .success(())
+                } catch { result = .failure(error) }
+            } else { result = .failure(CaptureError.download) }
+            Task { @MainActor in
+                guard let self else { return }
+                defer {
+                    self.batchDownloadProgress = nil
+                    self.batchDownloadProgressObservation = nil
+                }
+                switch result {
+                case .success:
+                    self.batchModelPath = destination
+                    self.status = "Whisper large-v3 を準備しました。録音後に再処理します。"
+                case .failure(let error):
+                    self.status = "高精度モデルの取得に失敗しました: \(error.localizedDescription)"
+                }
+            }
+        }
+        batchDownloadProgressObservation = task.progress.observe(\.fractionCompleted) { [weak self] progress, _ in
+            Task { @MainActor in self?.batchDownloadProgress = progress.fractionCompleted }
+        }
+        task.resume()
+    }
+
     func chooseWhisperCLI() {
         let panel = NSOpenPanel()
         panel.title = "whisper-cli を選択"
@@ -168,7 +254,7 @@ private final class AppModel: ObservableObject {
     }
 
     func start() {
-        guard ready, !isRecording, !isProcessing, !isStarting, !isStopping else { return }
+        guard ready, batchDownloadProgress == nil, !isRecording, !isProcessing, !isAwaitingBatchChoice, !isStarting, !isStopping else { return }
         isStarting = true
         Task {
             do {
@@ -203,6 +289,24 @@ private final class AppModel: ObservableObject {
                 audioDiagnosticSummary = ""
                 captureFailureMessage = nil
                 queuedAudioSeconds = 0
+                archiveFailureMessage = nil
+                batchFailureMessage = nil
+                batchStarted = false
+                batchDecisionMade = false
+                batchRunID = UUID()
+                isAwaitingBatchChoice = false
+                isBatchTranscribing = false
+                batchProgress = 0
+                batchProgressDetail = ""
+                estimatedBatchCompletion = nil
+                lastBatchProgressAt = nil
+                batchProgressStartedAt = nil
+                lastObservedBatchFraction = 0
+                lastObservedBatchProgressAt = nil
+                smoothedBatchSecondsPerFraction = nil
+                batchFallbackSpeakers = []
+                let archive = try SessionAudioArchive()
+                audioArchive = archive
                 let hostClockStart = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
                 let handler = MeetingAudioCapture(sessionStart: hostClockStart, emit: { [weak self] speaker, samples, offset in
                     self?.enqueue(samples: samples, speaker: speaker, offset: offset)
@@ -213,7 +317,7 @@ private final class AppModel: ObservableObject {
                     guard let self else { return }
                     self.captureStartFailureMessage = message
                     if self.isRecording { self.captureFailed(message) }
-                })
+                }, archive: archive)
                 let config = SCStreamConfiguration()
                 config.width = 2
                 config.height = 2
@@ -233,12 +337,20 @@ private final class AppModel: ObservableObject {
                 try await stream.startCapture()
                 if let captureStartFailureMessage { throw CaptureError.inference(captureStartFailureMessage) }
                 handler.stream = stream
+                sessionStartedUptime = ProcessInfo.processInfo.systemUptime
                 isStarting = false
                 isRecording = true
                 status = "文字起こし中（音声はこの Mac 内で処理）"
                 dismissedCandidate = false
                 dismissedEnd = false
             } catch {
+                if let archive = audioArchive {
+                    Task.detached(priority: .utility) {
+                        _ = await archive.finish()
+                        archive.remove()
+                    }
+                }
+                audioArchive = nil
                 self.capture = nil
                 isStarting = false
                 status = "録音を開始できません: \(error.localizedDescription)。画面収録とマイクの権限を確認してください。"
@@ -248,6 +360,7 @@ private final class AppModel: ObservableObject {
 
     func stop() {
         guard isRecording, !isStopping, let capture else { return }
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - (sessionStartedUptime ?? ProcessInfo.processInfo.systemUptime))
         isStopping = true
         status = "録音を停止しています…"
         Task {
@@ -258,7 +371,10 @@ private final class AppModel: ObservableObject {
                 return
             }
             await capture.flushAfterPendingCallbacks()
-            audioDiagnosticSummary = capture.diagnosticSummary()
+            audioDiagnosticSummary = String(format: "録音経過 %.1f秒\n%@", elapsed, capture.diagnosticSummary())
+            archiveFailureMessage = await capture.finishArchive()
+            if let archive = audioArchive { audioDiagnosticSummary += "\n保存診断: \(archive.diagnosticSummary())" }
+            sessionStartedUptime = nil
             isRecording = false
             isStopping = false
             isProcessing = true
@@ -270,11 +386,15 @@ private final class AppModel: ObservableObject {
 
     private func captureFailed(_ message: String) {
         guard isRecording, !isStopping, let capture else { status = message; return }
+        let elapsed = max(0, ProcessInfo.processInfo.systemUptime - (sessionStartedUptime ?? ProcessInfo.processInfo.systemUptime))
         isStopping = true
         status = message
         Task {
             await capture.flushAfterPendingCallbacks()
-            audioDiagnosticSummary = capture.diagnosticSummary()
+            audioDiagnosticSummary = String(format: "録音経過 %.1f秒\n%@", elapsed, capture.diagnosticSummary())
+            archiveFailureMessage = await capture.finishArchive()
+            if let archive = audioArchive { audioDiagnosticSummary += "\n保存診断: \(archive.diagnosticSummary())" }
+            sessionStartedUptime = nil
             isRecording = false
             isStopping = false
             isProcessing = true
@@ -307,7 +427,7 @@ private final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard let self else { return }
                     if let recognizedText, !recognizedText.isEmpty {
-                        self.lines.append(TranscriptLine(offset: offset, speaker: speaker, text: recognizedText))
+                        self.lines.append(TranscriptLine(offset: offset, endOffset: offset + audioSeconds, speaker: speaker, text: recognizedText))
                         self.lines.sort { $0.offset < $1.offset }
                         self.sttMetrics[speaker, default: STTMetrics()].succeeded += 1
                     } else if failureMessage == nil {
@@ -363,22 +483,213 @@ private final class AppModel: ObservableObject {
 
     private func finishWhenDrained() {
         guard !isRecording, !isStopping, isProcessing, pendingSegments == 0 else { return }
+        guard !batchStarted else { return }
+        batchStarted = true
         isProcessing = false
-        let issues = [captureFailureMessage,
-                      failedSegments > 0 ? "推論失敗 \(failedSegments) 区間" : nil,
-                      droppedAudioSeconds > 0 ? String(format: "破棄 %.0f 秒", droppedAudioSeconds) : nil].compactMap { $0 }
+        isAwaitingBatchChoice = true
+        status = "録音を終了しました。録音後の処理を選択してください。"
+    }
+
+    func chooseBatchTranscription() {
+        guard !batchDecisionMade else { return }
+        batchDecisionMade = true
+        isAwaitingBatchChoice = false
+        isProcessing = true
+        isBatchTranscribing = true
+        batchProgress = 0
+        batchProgressDetail = "whisper-cliを起動しています…"
+        estimatedBatchCompletion = nil
+        lastBatchProgressAt = Date()
+        batchProgressStartedAt = Date()
+        lastObservedBatchFraction = 0
+        lastObservedBatchProgressAt = nil
+        smoothedBatchSecondsPerFraction = nil
+        beginBatchTranscription()
+    }
+
+    func chooseRealtimeOnly() {
+        guard !batchDecisionMade else { return }
+        batchDecisionMade = true
+        isAwaitingBatchChoice = false
+        completeTranscription(outcome: nil, wasSkipped: true)
+    }
+
+    private func beginBatchTranscription() {
+        guard let archive = audioArchive,
+              let modelPath = batchModelPath,
+              let whisperPath,
+              Self.isValidBatchModel(modelPath),
+              archiveFailureMessage == nil else {
+            batchFailureMessage = archiveFailureMessage ?? "高精度モデルまたはバッチ用音声が未準備です。リアルタイム結果を保持します。"
+            completeTranscription(outcome: nil)
+            return
+        }
+        status = "録音音声を再処理しています…"
+        let archiveDirectory = archive.directory
+        let capturedSpeakers = archive.speakersWithInput
+        let runID = batchRunID
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = BatchTranscriber.transcribe(
+                archiveDirectory: archiveDirectory,
+                capturedSpeakers: capturedSpeakers,
+                modelURL: modelPath,
+                whisperURL: whisperPath,
+                progress: { [weak self] update in
+                    Task { @MainActor [weak self] in self?.updateBatchProgress(update, runID: runID) }
+                }
+            )
+            Task { @MainActor in
+                guard let self, self.batchRunID == runID else { return }
+                self.completeTranscription(outcome: outcome)
+            }
+        }
+    }
+
+    private func updateBatchProgress(_ update: BatchProgressUpdate, runID: UUID) {
+        guard isBatchTranscribing, batchRunID == runID else { return }
+        let now = Date()
+        let fraction = min(1, max(batchProgress, update.fractionCompleted))
+        batchProgress = fraction
+        lastBatchProgressAt = now
+        if let speaker = update.speaker, update.totalChunks > 0 {
+            batchProgressDetail = String(
+                format: "%@ 音声 %d/%d（この区間 %.0f%%）",
+                speaker.rawValue,
+                update.chunkNumber,
+                update.totalChunks,
+                update.chunkFraction * 100
+            )
+        } else {
+            batchProgressDetail = "後処理を完了しています…"
+        }
+
+        guard fraction > lastObservedBatchFraction,
+              let startedAt = batchProgressStartedAt else { return }
+        guard let previousAt = lastObservedBatchProgressAt else {
+            lastObservedBatchFraction = fraction
+            lastObservedBatchProgressAt = now
+            return
+        }
+        let delta = fraction - lastObservedBatchFraction
+        let interval = now.timeIntervalSince(previousAt)
+        guard delta >= 0.008, interval >= 0.5 else { return }
+        let sampleSecondsPerFraction = interval / delta
+        if let current = smoothedBatchSecondsPerFraction {
+            let bounded = min(current * 2, max(current * 0.5, sampleSecondsPerFraction))
+            smoothedBatchSecondsPerFraction = current * 0.7 + bounded * 0.3
+        } else {
+            smoothedBatchSecondsPerFraction = sampleSecondsPerFraction
+        }
+        lastObservedBatchFraction = fraction
+        lastObservedBatchProgressAt = now
+
+        let elapsed = now.timeIntervalSince(startedAt)
+        if fraction >= 0.025, elapsed >= 5,
+           let secondsPerFraction = smoothedBatchSecondsPerFraction {
+            estimatedBatchCompletion = now.addingTimeInterval(max(2, (1 - fraction) * secondsPerFraction))
+        }
+    }
+
+    func batchRemainingDescription(at date: Date) -> String {
+        guard let estimatedBatchCompletion else { return "残り時間を推定しています…" }
+        if let lastBatchProgressAt, date.timeIntervalSince(lastBatchProgressAt) > 90 {
+            return "進捗更新を待っています。残り時間を再計算中…"
+        }
+        if estimatedBatchCompletion <= date {
+            return "完了予定を過ぎたため、残り時間を再計算中…"
+        }
+        let remaining = max(0, estimatedBatchCompletion.timeIntervalSince(date))
+        if remaining < 60 { return String(format: "完了まで約%d秒", max(1, Int(remaining.rounded()))) }
+        if remaining < 3_600 {
+            let minutes = Int(remaining) / 60
+            let seconds = Int(remaining) % 60
+            return seconds < 15 ? "完了まで約\(minutes)分" : String(format: "完了まで約%d分%d秒", minutes, seconds)
+        }
+        let hours = Int(remaining) / 3_600
+        let minutes = (Int(remaining) % 3_600) / 60
+        return "完了まで約\(hours)時間\(minutes)分"
+    }
+
+    private func completeTranscription(outcome: BatchTranscriptionOutcome?, wasSkipped: Bool = false) {
+        if let outcome {
+            batchFallbackSpeakers = Set(outcome.failuresBySpeaker.keys)
+            var finalLines = lines.filter { outcome.failuresBySpeaker[$0.speaker] != nil }
+            var coverageWarnings: [String] = []
+            for speaker in Speaker.allCases {
+                guard let segments = outcome.segmentsBySpeaker[speaker] else { continue }
+                let realtimeLines = lines.filter { $0.speaker == speaker }
+                let ranges = (outcome.audioRangesBySpeaker[speaker] ?? []).sorted { $0.start < $1.start }
+                let coverageComplete = realtimeLines.allSatisfy { line in
+                    let utteranceEnd = line.endOffset ?? line.offset
+                    var coveredUntil = line.offset
+                    for range in ranges where range.end >= coveredUntil - 0.02 {
+                        guard range.start <= coveredUntil + 0.02 else { break }
+                        coveredUntil = max(coveredUntil, range.end)
+                        if coveredUntil >= utteranceEnd - 0.02 { return true }
+                    }
+                    return coveredUntil >= utteranceEnd - 0.02
+                }
+                if !coverageComplete {
+                    // A single uncovered realtime utterance means a chunk may be missing or
+                    // truncated. Keep this speaker's complete realtime transcript as a safe fallback.
+                    batchFallbackSpeakers.insert(speaker)
+                    finalLines.append(contentsOf: realtimeLines)
+                    let lastRangeEnd = ranges.last?.end
+                    if let lastRangeEnd {
+                        coverageWarnings.append(String(format: "%@: WAV終端 %.1f秒までの範囲に未保存の発話があり、リアルタイム結果を保持", speaker.rawValue, lastRangeEnd))
+                    } else {
+                        coverageWarnings.append("\(speaker.rawValue): バッチ音声がなく、リアルタイム結果を保持")
+                    }
+                } else {
+                    finalLines.append(contentsOf: segments.map {
+                        TranscriptLine(offset: $0.offset, endOffset: nil, speaker: speaker, text: $0.text)
+                    })
+                }
+            }
+            lines = finalLines.sorted { $0.offset < $1.offset }
+            let failures = outcome.failuresBySpeaker.map {
+                "\($0.key.rawValue): \($0.value)（リアルタイム結果を保持）"
+            }
+            let warnings = coverageWarnings + failures
+            if !warnings.isEmpty {
+                batchFailureMessage = warnings
+                    .joined(separator: " / ")
+            }
+        } else if !wasSkipped {
+            batchFallbackSpeakers = Set(Speaker.allCases)
+        }
+        isProcessing = false
+        isBatchTranscribing = false
+        if outcome != nil { batchProgress = 1 }
+        estimatedBatchCompletion = nil
+        let realtimeFallbackIssues = [
+            failedSegments > 0 ? "リアルタイム推論失敗 \(failedSegments) 区間" : nil,
+            droppedAudioSeconds > 0 ? String(format: "リアルタイム推論待ちで破棄 %.0f 秒", droppedAudioSeconds) : nil
+        ].compactMap { $0 }
+        let issues = [captureFailureMessage, wasSkipped ? nil : batchFailureMessage].compactMap { $0 } + realtimeFallbackIssues
         let selfStats = sttMetrics[.selfUser, default: STTMetrics()]
         let othersStats = sttMetrics[.others, default: STTMetrics()]
         audioDiagnosticSummary += "\nSTT 自分: queued \(selfStats.queued), success \(selfStats.succeeded), empty \(selfStats.empty), failed \(selfStats.failed)"
         audioDiagnosticSummary += "\nSTT 相手: queued \(othersStats.queued), success \(othersStats.succeeded), empty \(othersStats.empty), failed \(othersStats.failed)"
+        let batchSummary = wasSkipped
+            ? "スキップ（リアルタイム結果を使用）"
+            : (batchFailureMessage ?? "完了")
+        audioDiagnosticSummary += "\nバッチ: \(batchSummary)"
+        if let archive = audioArchive {
+            Task.detached(priority: .utility) { archive.remove() }
+        }
+        audioArchive = nil
         if !issues.isEmpty { status = "部分完了: \(issues.joined(separator: "、"))。保存前に欠落を確認してください。" }
+        else if wasSkipped {
+            status = lines.isEmpty ? "リアルタイム結果はありませんでした。" : "完了: \(lines.count) 件。リアルタイム結果を使用しています。"
+        }
         else {
-            status = lines.isEmpty ? "音声から発話を検出できませんでした。" : "完了: \(lines.count) 件。テキストを保存できます。"
+            status = lines.isEmpty ? "音声から発話を検出できませんでした。" : "完了: \(lines.count) 件。バッチ処理済みのテキストを保存できます。"
         }
     }
 
     func saveText() {
-        guard !lines.isEmpty else { return }
+        guard !lines.isEmpty, !isAwaitingBatchChoice else { return }
         let panel = NSSavePanel()
         let filenameFormatter = DateFormatter()
         filenameFormatter.locale = Locale(identifier: "en_US_POSIX")
@@ -387,9 +698,11 @@ private final class AppModel: ObservableObject {
         panel.nameFieldStringValue = "会議文字起こし-\(filenameFormatter.string(from: sessionStartedAt)).txt"
         panel.allowedContentTypes = [.plainText]
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let warnings = [captureFailureMessage,
-                        failedSegments > 0 ? "推論に失敗した区間: \(failedSegments)" : nil,
-                        droppedAudioSeconds > 0 ? String(format: "推論待ち上限で欠落した音声: 約 %.0f 秒", droppedAudioSeconds) : nil].compactMap { $0 }
+        let realtimeFallbackIssues = [
+            failedSegments > 0 ? "リアルタイム推論失敗区間: \(failedSegments)" : nil,
+            droppedAudioSeconds > 0 ? String(format: "リアルタイム推論待ち上限で破棄: 約 %.0f 秒", droppedAudioSeconds) : nil
+        ].compactMap { $0 }
+        let warnings = [captureFailureMessage, batchFailureMessage].compactMap { $0 } + realtimeFallbackIssues
         let warningHeader = warnings.isEmpty ? "" : "# 注意: この文字起こしは一部欠落している可能性があります\n# \(warnings.joined(separator: " / "))\n\n"
         let text = warningHeader + lines.sorted { $0.offset < $1.offset }.map { "[\($0.timeLabel)] \($0.speaker.rawValue): \($0.text)" }.joined(separator: "\n") + "\n"
         do { try text.write(to: url, atomically: true, encoding: .utf8); status = "保存しました: \(url.lastPathComponent)" }
@@ -400,7 +713,7 @@ private final class AppModel: ObservableObject {
         detectorTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(6))
-                guard let self, self.autoDetect, !self.isStarting, !self.isStopping, !self.isProcessing else { continue }
+                guard let self, self.autoDetect, !self.isStarting, !self.isStopping, !self.isProcessing, !self.isAwaitingBatchChoice else { continue }
                 let visible = await Self.hasMeetingWindow()
                 if visible && !self.meetingWasVisible && !self.isRecording && !self.dismissedCandidate {
                     self.meetingPrompt = "会議らしいウィンドウを検出しました。文字起こしを開始しますか？"
@@ -508,6 +821,7 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
     private let emit: @MainActor (Speaker, [Float], TimeInterval) -> Void
     private let onError: @MainActor (String) -> Void
     private let onStreamFailure: @MainActor (String) -> Void
+    private let archive: SessionAudioArchive
     private var accumulators: [Speaker: SpeechAccumulator] = [.selfUser: SpeechAccumulator(), .others: SpeechAccumulator()]
     private var converters: [Speaker: AVAudioConverter] = [:]
     private var inputFormats: [Speaker: AVAudioFormat] = [:]
@@ -519,11 +833,13 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
     init(sessionStart: TimeInterval,
          emit: @escaping @MainActor (Speaker, [Float], TimeInterval) -> Void,
          onError: @escaping @MainActor (String) -> Void,
-         onStreamFailure: @escaping @MainActor (String) -> Void) {
+         onStreamFailure: @escaping @MainActor (String) -> Void,
+         archive: SessionAudioArchive) {
         self.sessionStart = sessionStart
         self.emit = emit
         self.onError = onError
         self.onStreamFailure = onStreamFailure
+        self.archive = archive
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
@@ -593,6 +909,8 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
         }
         if let failure { reportAudioError(failure); return }
         guard !samples.isEmpty else { return }
+        let start = max(0, sampleTimestamp - sessionStart)
+        archive.append(samples, speaker: speaker, offset: start)
         let finiteSamples = samples.filter(\.isFinite)
         lock.lock()
         pathMetrics[speaker, default: AudioPathMetrics()].convertedFrames += samples.count
@@ -600,7 +918,6 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
         pathMetrics[speaker, default: AudioPathMetrics()].sumSquares += finiteSamples.reduce(0.0) { $0 + Double($1) * Double($1) }
         pathMetrics[speaker, default: AudioPathMetrics()].peak = max(pathMetrics[speaker, default: AudioPathMetrics()].peak, finiteSamples.reduce(Float.zero) { max($0, abs($1)) })
         lock.unlock()
-        let start = max(0, sampleTimestamp - sessionStart)
         let duration = Double(CMSampleBufferGetNumSamples(sampleBuffer)) / inputFormat.sampleRate
         lock.lock()
         var completed: [(samples: [Float], start: TimeInterval)] = []
@@ -655,6 +972,8 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
         }
     }
 
+    func finishArchive() async -> String? { await archive.finish() }
+
     func diagnosticSummary() -> String {
         lock.lock()
         let snapshot = pathMetrics
@@ -673,6 +992,7 @@ private final class MeetingAudioCapture: NSObject, SCStreamOutput, SCStreamDeleg
     }
 
     private func reportAudioError(_ message: String) {
+        archive.fail(message)
         lock.lock()
         let shouldReport = !didReportAudioError
         didReportAudioError = true
@@ -762,22 +1082,23 @@ private struct ContentView: View {
             }
             HStack(spacing: 10) {
                 Button { model.start() } label: { Label("開始", systemImage: "record.circle") }
-                    .buttonStyle(.borderedProminent).disabled(!model.ready || model.isRecording || model.isProcessing || model.isStarting || model.isStopping)
+                    .buttonStyle(.borderedProminent).disabled(!model.ready || model.batchDownloadProgress != nil || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping)
                 Button { model.stop() } label: { Label("終了", systemImage: "stop.circle") }
                     .buttonStyle(.bordered).disabled(!model.isRecording || model.isStopping)
                 Button { model.saveText() } label: { Label("テキストを保存", systemImage: "arrow.down.to.line") }
-                    .buttonStyle(.bordered).disabled(model.lines.isEmpty || model.isRecording || model.isProcessing || model.isStarting || model.isStopping)
+                    .buttonStyle(.bordered).disabled(model.lines.isEmpty || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping)
                 Spacer()
             }
-            if !model.ready {
+            if !model.ready || model.batchModelPath == nil {
                 GroupBox("初回セットアップ") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Image(systemName: model.modelPath == nil ? "circle" : "checkmark.circle.fill").foregroundStyle(model.modelPath == nil ? Color.secondary : Color.green)
-                            Text("Kotoba-Whisper v2 Q5_0（約538 MB）")
+                            Text("リアルタイム Kotoba-Whisper v2 Q5_0（約538 MB）")
                             Spacer()
                             if model.modelPath == nil {
-                                Button(model.downloadProgress == nil ? "モデルを取得" : "取得中") { model.downloadModel() }.disabled(model.downloadProgress != nil)
+                                Button(model.downloadProgress == nil ? "モデルを取得" : "取得中") { model.downloadModel() }
+                                    .disabled(model.downloadProgress != nil || model.batchDownloadProgress != nil)
                             }
                         }
                         if let progress = model.downloadProgress { ProgressView(value: progress).progressViewStyle(.linear) }
@@ -787,6 +1108,16 @@ private struct ContentView: View {
                             Spacer()
                             Button("実行ファイルを選択…") { model.chooseWhisperCLI() }
                         }
+                        HStack {
+                            Image(systemName: model.batchModelPath == nil ? "circle" : "checkmark.circle.fill").foregroundStyle(model.batchModelPath == nil ? Color.secondary : Color.green)
+                            Text("録音後 Whisper large-v3（約3.1 GB）")
+                            Spacer()
+                            if model.batchModelPath == nil {
+                                Button(model.batchDownloadProgress == nil ? "高精度モデルを取得" : "取得中") { model.downloadBatchModel() }
+                                    .disabled(model.batchDownloadProgress != nil || model.downloadProgress != nil || model.isRecording || model.isProcessing)
+                            }
+                        }
+                        if let progress = model.batchDownloadProgress { ProgressView(value: progress).progressViewStyle(.linear) }
                     }.padding(.vertical, 4)
                 }
             }
@@ -795,6 +1126,23 @@ private struct ContentView: View {
                 Spacer()
                 Toggle("会議候補を通知", isOn: $model.autoDetect).toggleStyle(.switch).labelsHidden()
                 Text("自動検知").font(.caption).foregroundStyle(.secondary)
+            }
+            if model.isBatchTranscribing {
+                GroupBox("録音音声を再処理中") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(model.batchProgressDetail).font(.caption)
+                            Spacer()
+                            Text("\(Int(model.batchProgress * 100))%").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                        ProgressView(value: model.batchProgress).progressViewStyle(.linear)
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            Text(model.batchRemainingDescription(at: context.date))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }.padding(.vertical, 2)
+                }
             }
             if !model.audioDiagnosticSummary.isEmpty {
                 DisclosureGroup("音声診断（音声・文字起こし本文は記録しません）") {
@@ -831,6 +1179,12 @@ private struct ContentView: View {
             }
             Text("「自分」=マイク、「相手」=システム音声（他アプリの音声も含む）。ヘッドホン推奨。マイクは会議アプリのミュートと連動しません。")
                 .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .alert("録音後の処理", isPresented: $model.isAwaitingBatchChoice) {
+            Button("Whisper large-v3で再処理") { model.chooseBatchTranscription() }
+            Button("リアルタイム結果を使う", role: .cancel) { model.chooseRealtimeOnly() }
+        } message: {
+            Text("高精度モデルで録音音声を再認識します。長い録音では完了まで時間がかかります。")
         }
         .padding(20)
     }

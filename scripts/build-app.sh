@@ -22,6 +22,8 @@ swiftc -parse-as-library -O \
   -framework SwiftUI \
   -framework UniformTypeIdentifiers \
   -o "$ROOT_DIR/.build/MeetingScribe" \
+  "$ROOT_DIR/Sources/MeetingScribe/BatchTranscriber.swift" \
+  "$ROOT_DIR/Sources/MeetingScribe/SessionAudioArchive.swift" \
   "$ROOT_DIR/Sources/MeetingScribe/main.swift"
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
