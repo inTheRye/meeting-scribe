@@ -146,8 +146,10 @@ private final class AppModel: ObservableObject {
     }
 
     static func findWhisperCLI() -> URL? {
+        let bundledCLI = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Frameworks/whisper-cli")
         let savedPath = UserDefaults.standard.string(forKey: "whisperCLIPath")
-        let candidates = [savedPath, "/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"].compactMap { $0 }
+        let candidates = [bundledCLI.path, savedPath, "/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"].compactMap { $0 }
         return candidates.map(URL.init(fileURLWithPath:)).first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 

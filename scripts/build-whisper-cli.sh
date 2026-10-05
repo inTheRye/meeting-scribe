@@ -14,6 +14,6 @@ if [ ! -d "$SOURCE_DIR/.git" ]; then
   git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$SOURCE_DIR"
 fi
 
-cmake -S "$SOURCE_DIR" -B "$SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
-cmake --build "$SOURCE_DIR/build" --config Release --target whisper-cli -j "$(sysctl -n hw.ncpu)"
+cmake -S "$SOURCE_DIR" -B "$SOURCE_DIR/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DGGML_METAL=ON
+cmake --build "$SOURCE_DIR/build" --config Release --target whisper-cli -j "$(getconf _NPROCESSORS_ONLN)"
 echo "whisper-cli: $SOURCE_DIR/build/bin/whisper-cli"
