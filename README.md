@@ -11,18 +11,38 @@ Zoom、Google Meet、Teams などのオンライン会議をローカルで文�
 - 結果は時刻、話者ラベル付きの UTF-8 テキストとして保存できます。生音声は処理が完了すると一時ファイルから削除されます。録音中は両話者合計で約230 MB/時の一時ディスク容量を使います。音声全体をメモリへ読み込まず、保存書き込み待ちも10秒分に制限します。
 - Zoom/Meet/Teams の会議らしいタイトルを持つウィンドウを確認し、開始・終了前に確認ダイアログを出します。完全な会議状態検出ではなく、手動操作が基本です。
 
-## ビルドと起動
+## ビルド・インストール・起動
 
-必要なものは Xcode Command Line Tools（Swift コンパイラと macOS SDK）、CMake、Git です。アプリは arm64 の `.app` バンドルとして生成します。署名 identity がある環境では `MEETING_SCRIBE_CODESIGN_IDENTITY` に identity 名を指定できます。省略時は ad-hoc 署名です。
+対象は macOS 15 以降の Apple Silicon です。必要なものは Xcode Command Line Tools（Swift コンパイラ、macOS SDK、Git）、CMake、Homebrew です。Command Line Tools が未導入なら、まずターミナルで次を実行してインストールを完了してください。
+
+```sh
+xcode-select -p >/dev/null 2>&1 || xcode-select --install
+```
+
+Homebrew も未導入の場合は[公式手順](https://brew.sh/)で先にインストールしてください。Homebrew と Command Line Tools の準備ができたら、プロジェクトのルートディレクトリーで次を実行します。
 
 ```sh
 brew install cmake
 ./scripts/build-whisper-cli.sh
 ./scripts/build-app.sh
-open "dist/Meeting Scribe.app"
+./scripts/install-app.sh
+open "/Applications/Meeting Scribe.app"
 ```
 
-初回起動後、「実行ファイルを選択…」を押し、プロジェクト内の `.local/whisper.cpp/build/bin/whisper-cli` を選択します。Kotoba-Whisper v2 Q5_0 の「モデルを取得」に加えて、「高精度モデルを取得」から Whisper large-v3 をダウンロードしてください。large-v3は約3.1 GBあり、推論時に数GBの追加メモリを使います。モデルは `~/Library/Application Support/MeetingScribe/Models/` に置かれます。両モデルの取得後はネットワークを切っても文字起こしできます。large-v3未取得でも録音できますが、終了後はリアルタイム結果を使う選択肢のみ利用できます。
+`build-whisper-cli.sh` は whisper.cpp を取得してビルドし、`build-app.sh` は arm64 の `.app` を `dist/Meeting Scribe.app` に作ります。whisper.cpp の取得にはネットワーク接続が必要です。SDKが古くビルドできない場合は、Xcode Command Line Toolsを更新してください。
+
+`install-app.sh` はビルド済みアプリの署名を検証してから、標準の `/Applications` にインストールまたは更新します。既定の動作では `sudo` を使いません。書き込み権限がない場合はユーザー用の Applications フォルダーにインストールできます。
+
+```sh
+./scripts/install-app.sh "$HOME/Applications"
+open "$HOME/Applications/Meeting Scribe.app"
+```
+
+更新するときはアプリを終了し、`build-whisper-cli.sh`（whisper.cpp を新規取得または再ビルドするとき）と `build-app.sh` を実行してから `install-app.sh` を再実行してください。ユーザー用フォルダーにインストールした場合は、更新時も `./scripts/install-app.sh "$HOME/Applications"` のように同じ導入先を指定します。インストール先の既存アプリは、新しい `.app` の署名確認後に置き換わります。モデルはユーザーの Application Support 内にあるため、アプリ更新で再取得されません。
+
+Apple Development などの署名 identity がある場合は `MEETING_SCRIBE_CODESIGN_IDENTITY` に identity 名を指定してビルドできます。省略時は ad-hoc 署名です。ad-hoc 署名のアプリは公証されません。再ビルド後に macOS が録音権限を再度求める場合は、システム設定で Meeting Scribe にマイクと「画面収録とシステムオーディオ録音」のアクセスを許可してください。
+
+`.app`にはwhisper.cpp実行ファイルと必要なライブラリが含まれ、初回起動時に実行ファイルを選択する必要はありません。録音には Kotoba-Whisper v2 Q5_0 の「モデルを取得」が必要です。終了後の再処理を使う場合は「高精度モデルを取得」から Whisper large-v3 も取得してください。large-v3は約3.1 GBあり、推論時に数GBの追加メモリを使います。モデルは `~/Library/Application Support/MeetingScribe/Models/` に置かれます。両モデルの取得後はネットワークを切っても文字起こしできます。large-v3未取得でも録音できますが、終了後はリアルタイム結果を使う選択肢のみ利用できます。
 
 ## 録音後のバッチ処理
 
