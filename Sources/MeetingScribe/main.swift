@@ -620,6 +620,15 @@ private final class AppModel: ObservableObject {
             for speaker in Speaker.allCases {
                 guard let segments = outcome.segmentsBySpeaker[speaker] else { continue }
                 let realtimeLines = lines.filter { $0.speaker == speaker }
+                if let qualityWarning = BatchTranscriptQualityGuard.fallbackReason(
+                    realtimeTexts: realtimeLines.map(\.text),
+                    batchSegments: segments
+                ) {
+                    batchFallbackSpeakers.insert(speaker)
+                    finalLines.append(contentsOf: realtimeLines)
+                    coverageWarnings.append("\(speaker.rawValue): \(qualityWarning)")
+                    continue
+                }
                 let ranges = (outcome.audioRangesBySpeaker[speaker] ?? []).sorted { $0.start < $1.start }
                 let coverageComplete = realtimeLines.allSatisfy { line in
                     let utteranceEnd = line.endOffset ?? line.offset

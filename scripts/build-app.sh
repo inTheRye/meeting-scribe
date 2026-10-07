@@ -29,6 +29,7 @@ swiftc -parse-as-library -O \
   -framework UniformTypeIdentifiers \
   -o "$ROOT_DIR/.build/MeetingScribe" \
   "$ROOT_DIR/Sources/MeetingScribe/BatchTranscriber.swift" \
+  "$ROOT_DIR/Sources/MeetingScribe/BatchTranscriptQualityGuard.swift" \
   "$ROOT_DIR/Sources/MeetingScribe/SessionAudioArchive.swift" \
   "$ROOT_DIR/Sources/MeetingScribe/main.swift"
 rm -rf "$APP_DIR"
