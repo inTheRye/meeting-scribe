@@ -540,11 +540,15 @@ private final class AppModel: ObservableObject {
         status = "録音音声を再処理しています…"
         let archiveDirectory = archive.directory
         let capturedSpeakers = archive.speakersWithInput
+        let realtimeSegmentsBySpeaker = Dictionary(grouping: lines, by: \.speaker).mapValues { speakerLines in
+            speakerLines.map { BatchTranscriptSegment(offset: $0.offset, endOffset: $0.endOffset, text: $0.text) }
+        }
         let runID = batchRunID
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = BatchTranscriber.transcribe(
                 archiveDirectory: archiveDirectory,
                 capturedSpeakers: capturedSpeakers,
+                realtimeSegmentsBySpeaker: realtimeSegmentsBySpeaker,
                 modelURL: modelPath,
                 whisperURL: whisperPath,
                 progress: { [weak self] update in
@@ -631,15 +635,8 @@ private final class AppModel: ObservableObject {
             for speaker in Speaker.allCases {
                 guard let segments = outcome.segmentsBySpeaker[speaker] else { continue }
                 let realtimeLines = lines.filter { $0.speaker == speaker }
-                if let qualityWarning = BatchTranscriptQualityGuard.fallbackReason(
-                    realtimeTexts: realtimeLines.map(\.text),
-                    batchSegments: segments
-                ) {
-                    batchFallbackSpeakers.insert(speaker)
-                    finalLines.append(contentsOf: realtimeLines)
-                    coverageWarnings.append("\(speaker.rawValue): \(qualityWarning)")
-                    continue
-                }
+                let qualityFallbacks = outcome.qualityFallbacksBySpeaker[speaker] ?? []
+                if !qualityFallbacks.isEmpty { batchFallbackSpeakers.insert(speaker) }
                 let ranges = (outcome.audioRangesBySpeaker[speaker] ?? []).sorted { $0.start < $1.start }
                 let coverageComplete = realtimeLines.allSatisfy { line in
                     let utteranceEnd = line.endOffset ?? line.offset
@@ -663,9 +660,34 @@ private final class AppModel: ObservableObject {
                         coverageWarnings.append("\(speaker.rawValue): バッチ音声がなく、リアルタイム結果を保持")
                     }
                 } else {
-                    finalLines.append(contentsOf: segments.map {
+                    let selection = BatchTranscriptSelection.resolve(
+                        batchSegments: segments,
+                        realtimeSegments: realtimeLines.map {
+                            BatchTranscriptSegment(offset: $0.offset, endOffset: $0.endOffset, text: $0.text)
+                        },
+                        audioRanges: ranges,
+                        qualityFallbacks: qualityFallbacks
+                    )
+                    finalLines.append(contentsOf: selection.batchSegments.map {
                         TranscriptLine(offset: $0.offset, endOffset: nil, speaker: speaker, text: $0.text)
                     })
+                    finalLines.append(contentsOf: selection.realtimeSegments.map { segment in
+                        TranscriptLine(offset: segment.offset, endOffset: segment.endOffset, speaker: speaker, text: segment.text)
+                    })
+                    if !qualityFallbacks.isEmpty {
+                        for fallback in qualityFallbacks {
+                            coverageWarnings.append(String(
+                                format: "%@: %.0f〜%.0f秒は%@のためリアルタイム結果を保持",
+                                speaker.rawValue,
+                                fallback.range.start,
+                                fallback.range.end,
+                                fallback.reason
+                            ))
+                        }
+                        if !selection.expandedFallbackRanges.isEmpty {
+                            coverageWarnings.append("\(speaker.rawValue): 境界をまたぐ発話を欠落させないため、隣接チャンクもリアルタイム結果を使用")
+                        }
+                    }
                 }
             }
             lines = finalLines.sorted { $0.offset < $1.offset }
