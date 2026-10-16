@@ -174,6 +174,63 @@ final class SessionAudioArchive: @unchecked Sendable {
         try? FileManager.default.removeItem(at: directory)
     }
 
+    func export(to parentDirectory: URL, sessionStartedAt: Date, elapsed: TimeInterval,
+                diagnosticSummary: String, failureMessage: String?) throws -> URL {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let exportDirectory = parentDirectory.appendingPathComponent(
+            "会議音声-\(formatter.string(from: sessionStartedAt))-\(UUID().uuidString.prefix(8))",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: exportDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+
+        do {
+            let files = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isRegularFileKey]
+            ).filter { $0.pathExtension == "wav" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+            for file in files {
+                try FileManager.default.copyItem(
+                    at: file,
+                    to: exportDirectory.appendingPathComponent(file.lastPathComponent)
+                )
+            }
+
+            let fileList = files.isEmpty
+                ? "WAVファイルはありません（音声入力なし、または保存エラーの可能性があります）。"
+                : files.map { "- \($0.lastPathComponent)" }.joined(separator: "\n")
+            let manifest = [
+                "Meeting Scribe 音声診断データ",
+                "録音開始: \(ISO8601DateFormatter().string(from: sessionStartedAt))",
+                String(format: "録音経過: %.2f秒", elapsed),
+                "形式: 16 kHz / mono / PCM 16-bit WAV。入力音声を変換したASR処理用データです。",
+                "ファイルは話者別・最大5分単位です。ファイル名末尾の連番は開始位置（300秒刻み）を示します。",
+                "PCM変換後のサンプル振幅が全て0.001未満のチャンクは保存時に削除されます。ファイルがない時間帯は微小音声、無音、または取得欠落の可能性があります。",
+                "音声取得・保存エラー: \(failureMessage ?? "なし")",
+                "音声診断:",
+                diagnosticSummary.isEmpty ? "なし" : diagnosticSummary,
+                "WAVファイル:",
+                fileList,
+                ""
+            ].joined(separator: "\n")
+            try manifest.write(
+                to: exportDirectory.appendingPathComponent("音声診断.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+            return exportDirectory
+        } catch {
+            try? FileManager.default.removeItem(at: exportDirectory)
+            throw error
+        }
+    }
+
     static func removeAbandonedArchives() {
         let temporaryDirectory = FileManager.default.temporaryDirectory
         guard let entries = try? FileManager.default.contentsOfDirectory(

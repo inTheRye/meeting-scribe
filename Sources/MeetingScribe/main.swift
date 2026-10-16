@@ -53,6 +53,7 @@ private final class AppModel: ObservableObject {
     @Published var isStopping = false
     @Published var isAwaitingBatchChoice = false
     @Published var isBatchTranscribing = false
+    @Published var isSavingAudio = false
     @Published var batchProgress = 0.0
     @Published var batchProgressDetail = ""
     @Published var estimatedBatchCompletion: Date?
@@ -67,6 +68,7 @@ private final class AppModel: ObservableObject {
     @Published var meetingPrompt: String?
     @Published var autoDetect = true
     @Published var audioDiagnosticSummary = ""
+    @Published var canSaveAudio = false
 
     private var capture: MeetingAudioCapture?
     private var audioArchive: SessionAudioArchive?
@@ -82,6 +84,7 @@ private final class AppModel: ObservableObject {
     private var smoothedBatchSecondsPerFraction: TimeInterval?
     private let inferenceQueue = OperationQueue()
     private var sessionStartedAt = Date()
+    private var recordedDuration: TimeInterval = 0
     private var sessionStartedUptime: TimeInterval?
     private var detectorTask: Task<Void, Never>?
     private var pendingSegments = 0
@@ -256,7 +259,11 @@ private final class AppModel: ObservableObject {
     }
 
     func start() {
-        guard ready, batchDownloadProgress == nil, !isRecording, !isProcessing, !isAwaitingBatchChoice, !isStarting, !isStopping else { return }
+        guard ready, batchDownloadProgress == nil, !isRecording, !isProcessing, !isAwaitingBatchChoice, !isStarting, !isStopping, !isSavingAudio else { return }
+        guard !canSaveAudio else {
+            status = "前回の音声が未保存です。「音声を保存」してから次の録音を開始してください。"
+            return
+        }
         isStarting = true
         Task {
             do {
@@ -289,6 +296,8 @@ private final class AppModel: ObservableObject {
                 droppedAudioSeconds = 0
                 sttMetrics = [.selfUser: STTMetrics(), .others: STTMetrics()]
                 audioDiagnosticSummary = ""
+                canSaveAudio = false
+                recordedDuration = 0
                 captureFailureMessage = nil
                 queuedAudioSeconds = 0
                 archiveFailureMessage = nil
@@ -373,6 +382,7 @@ private final class AppModel: ObservableObject {
                 return
             }
             await capture.flushAfterPendingCallbacks()
+            recordedDuration = elapsed
             audioDiagnosticSummary = String(format: "録音経過 %.1f秒\n%@", elapsed, capture.diagnosticSummary())
             archiveFailureMessage = await capture.finishArchive()
             if let archive = audioArchive { audioDiagnosticSummary += "\n保存診断: \(archive.diagnosticSummary())" }
@@ -393,6 +403,7 @@ private final class AppModel: ObservableObject {
         status = message
         Task {
             await capture.flushAfterPendingCallbacks()
+            recordedDuration = elapsed
             audioDiagnosticSummary = String(format: "録音経過 %.1f秒\n%@", elapsed, capture.diagnosticSummary())
             archiveFailureMessage = await capture.finishArchive()
             if let archive = audioArchive { audioDiagnosticSummary += "\n保存診断: \(archive.diagnosticSummary())" }
@@ -686,16 +697,54 @@ private final class AppModel: ObservableObject {
             ? "スキップ（リアルタイム結果を使用）"
             : (batchFailureMessage ?? "完了")
         audioDiagnosticSummary += "\nバッチ: \(batchSummary)"
-        if let archive = audioArchive {
-            Task.detached(priority: .utility) { archive.remove() }
-        }
-        audioArchive = nil
+        canSaveAudio = audioArchive != nil
         if !issues.isEmpty { status = "部分完了: \(issues.joined(separator: "、"))。保存前に欠落を確認してください。" }
         else if wasSkipped {
             status = lines.isEmpty ? "リアルタイム結果はありませんでした。" : "完了: \(lines.count) 件。リアルタイム結果を使用しています。"
         }
         else {
             status = lines.isEmpty ? "音声から発話を検出できませんでした。" : "完了: \(lines.count) 件。バッチ処理済みのテキストを保存できます。"
+        }
+    }
+
+    func saveAudio() {
+        guard canSaveAudio, let archive = audioArchive,
+              !isRecording, !isProcessing, !isAwaitingBatchChoice, !isStopping, !isStarting, !isSavingAudio else { return }
+        let panel = NSOpenPanel()
+        panel.title = "会議音声の保存先を選択"
+        panel.message = "話者別WAVと、録音時間・音声診断を含むフォルダーを作成します。"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let parentDirectory = panel.url else { return }
+        isSavingAudio = true
+        status = "音声と診断データを保存しています…"
+        let startedAt = sessionStartedAt
+        let duration = recordedDuration
+        let diagnostics = audioDiagnosticSummary
+        let failure = [captureFailureMessage, archiveFailureMessage]
+            .compactMap { $0 }
+            .joined(separator: " / ")
+        let combinedFailure = failure.isEmpty ? nil : failure
+        Task {
+            defer { isSavingAudio = false }
+            do {
+                let exportedDirectory = try await Task.detached(priority: .utility) {
+                    try archive.export(
+                        to: parentDirectory,
+                        sessionStartedAt: startedAt,
+                        elapsed: duration,
+                        diagnosticSummary: diagnostics,
+                        failureMessage: combinedFailure
+                    )
+                }.value
+                archive.remove()
+                audioArchive = nil
+                canSaveAudio = false
+                status = "音声と診断データを保存しました: \(exportedDirectory.lastPathComponent)"
+            } catch {
+                status = "音声を保存できませんでした: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -1093,11 +1142,13 @@ private struct ContentView: View {
             }
             HStack(spacing: 10) {
                 Button { model.start() } label: { Label("開始", systemImage: "record.circle") }
-                    .buttonStyle(.borderedProminent).disabled(!model.ready || model.batchDownloadProgress != nil || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping)
+                    .buttonStyle(.borderedProminent).disabled(!model.ready || model.batchDownloadProgress != nil || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping || model.isSavingAudio)
                 Button { model.stop() } label: { Label("終了", systemImage: "stop.circle") }
                     .buttonStyle(.bordered).disabled(!model.isRecording || model.isStopping)
                 Button { model.saveText() } label: { Label("テキストを保存", systemImage: "arrow.down.to.line") }
                     .buttonStyle(.bordered).disabled(model.lines.isEmpty || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping)
+                Button { model.saveAudio() } label: { Label("音声を保存", systemImage: "waveform") }
+                    .buttonStyle(.bordered).disabled(!model.canSaveAudio || model.isRecording || model.isProcessing || model.isAwaitingBatchChoice || model.isStarting || model.isStopping || model.isSavingAudio)
                 Spacer()
             }
             if !model.ready || model.batchModelPath == nil {
