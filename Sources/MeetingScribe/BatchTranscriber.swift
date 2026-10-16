@@ -3,12 +3,94 @@ import Darwin
 
 struct BatchTranscriptSegment {
     let offset: TimeInterval
+    let endOffset: TimeInterval?
     let text: String
+
+    init(offset: TimeInterval, endOffset: TimeInterval? = nil, text: String) {
+        self.offset = offset
+        self.endOffset = endOffset
+        self.text = text
+    }
 }
 
 struct BatchAudioRange {
     let start: TimeInterval
     let end: TimeInterval
+}
+
+struct BatchTranscriptQualityFallback {
+    let range: BatchAudioRange
+    let reason: String
+}
+
+struct BatchTranscriptSelection {
+    let batchSegments: [BatchTranscriptSegment]
+    let realtimeSegments: [BatchTranscriptSegment]
+    let resolvedFallbackRanges: [BatchAudioRange]
+    let expandedFallbackRanges: [BatchAudioRange]
+
+    static func resolve(
+        batchSegments: [BatchTranscriptSegment],
+        realtimeSegments: [BatchTranscriptSegment],
+        audioRanges: [BatchAudioRange],
+        qualityFallbacks: [BatchTranscriptQualityFallback]
+    ) -> BatchTranscriptSelection {
+        var resolvedRanges = qualityFallbacks.map(\.range)
+        let originalRanges = resolvedRanges
+        var didExpand = true
+
+        while didExpand {
+            didExpand = false
+            for fallbackRange in resolvedRanges {
+                for segment in realtimeSegments {
+                    guard let end = segment.endOffset,
+                          segment.offset.isFinite,
+                          end.isFinite,
+                          segment.offset < end else { continue }
+                    for (boundary, crossesToNext) in [(fallbackRange.start, false), (fallbackRange.end, true)] {
+                        guard segment.offset < boundary, end > boundary else { continue }
+                        let adjacentRange = crossesToNext
+                            ? audioRanges.first(where: { abs($0.start - boundary) <= 0.02 })
+                            : audioRanges.last(where: { abs($0.end - boundary) <= 0.02 })
+                        guard let adjacentRange,
+                              !resolvedRanges.contains(where: { sameRange($0, adjacentRange) }) else { continue }
+                        resolvedRanges.append(adjacentRange)
+                        didExpand = true
+                    }
+                }
+            }
+        }
+
+        let expandedRanges = resolvedRanges.filter { resolved in
+            !originalRanges.contains(where: { sameRange($0, resolved) })
+        }
+        let retainedBatchSegments = batchSegments.filter { segment in
+            !resolvedRanges.contains { contains($0, offset: segment.offset) }
+        }
+        let fallbackRealtimeSegments = realtimeSegments.filter { segment in
+            resolvedRanges.contains { overlaps(segment, range: $0) }
+        }
+        return BatchTranscriptSelection(
+            batchSegments: retainedBatchSegments,
+            realtimeSegments: fallbackRealtimeSegments,
+            resolvedFallbackRanges: resolvedRanges,
+            expandedFallbackRanges: expandedRanges
+        )
+    }
+
+    private static func sameRange(_ lhs: BatchAudioRange, _ rhs: BatchAudioRange) -> Bool {
+        abs(lhs.start - rhs.start) <= 0.02 && abs(lhs.end - rhs.end) <= 0.02
+    }
+
+    private static func contains(_ range: BatchAudioRange, offset: TimeInterval) -> Bool {
+        offset >= range.start && offset < range.end
+    }
+
+    private static func overlaps(_ segment: BatchTranscriptSegment, range: BatchAudioRange) -> Bool {
+        guard let end = segment.endOffset else { return contains(range, offset: segment.offset) }
+        guard segment.offset < end else { return contains(range, offset: segment.offset) }
+        return segment.offset < range.end && end > range.start
+    }
 }
 
 struct BatchProgressUpdate {
@@ -23,6 +105,7 @@ struct BatchTranscriptionOutcome {
     let segmentsBySpeaker: [Speaker: [BatchTranscriptSegment]]
     let failuresBySpeaker: [Speaker: String]
     let audioRangesBySpeaker: [Speaker: [BatchAudioRange]]
+    let qualityFallbacksBySpeaker: [Speaker: [BatchTranscriptQualityFallback]]
 }
 
 enum BatchTranscriber {
@@ -31,6 +114,7 @@ enum BatchTranscriber {
     static func transcribe(
         archiveDirectory: URL,
         capturedSpeakers: Set<Speaker>,
+        realtimeSegmentsBySpeaker: [Speaker: [BatchTranscriptSegment]],
         modelURL: URL,
         whisperURL: URL,
         progress: @escaping (BatchProgressUpdate) -> Void
@@ -38,6 +122,7 @@ enum BatchTranscriber {
         var results: [Speaker: [BatchTranscriptSegment]] = [:]
         var failures: [Speaker: String] = [:]
         var audioRanges: [Speaker: [BatchAudioRange]] = [:]
+        var qualityFallbacks: [Speaker: [BatchTranscriptQualityFallback]] = [:]
         let chunks: [URL]
         do {
             chunks = try FileManager.default.contentsOfDirectory(
@@ -48,7 +133,12 @@ enum BatchTranscriber {
             let message = "一時音声ファイルを読み取れませんでした: \(error.localizedDescription)"
             for speaker in Speaker.allCases { failures[speaker] = message }
             progress(BatchProgressUpdate(fractionCompleted: 1, speaker: nil, chunkNumber: 0, totalChunks: 0, chunkFraction: 1))
-            return BatchTranscriptionOutcome(segmentsBySpeaker: results, failuresBySpeaker: failures, audioRangesBySpeaker: audioRanges)
+            return BatchTranscriptionOutcome(
+                segmentsBySpeaker: results,
+                failuresBySpeaker: failures,
+                audioRangesBySpeaker: audioRanges,
+                qualityFallbacksBySpeaker: qualityFallbacks
+            )
         }
 
         struct ChunkJob {
@@ -114,7 +204,25 @@ enum BatchTranscriber {
                         outputDirectory: archiveDirectory,
                         progress: reportChunkProgress
                     )
-                    results[job.speaker, default: []].append(contentsOf: segments)
+                    let realtimeSegments = (realtimeSegmentsBySpeaker[job.speaker] ?? []).filter {
+                        if let end = $0.endOffset, $0.offset < end {
+                            return $0.offset < chunkEnd && end > chunkOffset
+                        }
+                        return $0.offset >= chunkOffset && $0.offset < chunkEnd
+                    }
+                    if let reason = BatchTranscriptQualityGuard.fallbackReason(
+                        realtimeSegments: realtimeSegments,
+                        batchSegments: segments
+                    ) {
+                        qualityFallbacks[job.speaker, default: []].append(
+                            BatchTranscriptQualityFallback(
+                                range: BatchAudioRange(start: chunkOffset, end: chunkEnd),
+                                reason: reason
+                            )
+                        )
+                    } else {
+                        results[job.speaker, default: []].append(contentsOf: segments)
+                    }
                 } catch {
                     failures[job.speaker] = error.localizedDescription
                     results.removeValue(forKey: job.speaker)
@@ -127,7 +235,12 @@ enum BatchTranscriber {
             results[speaker] = []
         }
         for speaker in results.keys { results[speaker]?.sort { $0.offset < $1.offset } }
-        return BatchTranscriptionOutcome(segmentsBySpeaker: results, failuresBySpeaker: failures, audioRangesBySpeaker: audioRanges)
+        return BatchTranscriptionOutcome(
+            segmentsBySpeaker: results,
+            failuresBySpeaker: failures,
+            audioRangesBySpeaker: audioRanges,
+            qualityFallbacksBySpeaker: qualityFallbacks
+        )
     }
 
     private static func audioDuration(of url: URL) throws -> TimeInterval {
